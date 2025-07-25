@@ -1,5 +1,7 @@
 # 1️⃣ Install dependencies
-!pip install -q gradio pandas matplotlib seaborn plotly requests
+!pip install -q gradio pandas matplotlib seaborn plotly requests openai
+from google.colab import userdata
+userdata.get('OPENROUTER_API_KEY')
 
 # 2️⃣ Imports
 import gradio as gr
@@ -10,14 +12,63 @@ import plotly.express as px
 import tempfile
 import os
 import requests
+import warnings
+from openai import OpenAI
 
-# 3️⃣ Set your Groq API Key
-groq_api_key = "##############"  # ← Replace with your Groq API Key
+# Suppress warnings from matplotlib
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+
+# 3️⃣ Set your OpenRouter API Key
+# Method 1: Using Colab Secrets (Recommended)
+try:
+    from google.colab import userdata
+    openrouter_api_key = userdata.get('OPENROUTER_API_KEY')
+except:
+    # Method 2: Direct assignment (replace with your actual key)
+    openrouter_api_key = "your-openrouter-api-key-here"  # ⚠️ Replace this with your actual API key
+    
+# Method 3: Environment variable fallback
+if not openrouter_api_key:
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+
+# Initialize OpenRouter client
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=openrouter_api_key,
+) if openrouter_api_key else None
+
 global_df = None
 
-# 4️⃣ Groq AI insight function
-def ask_groq_about_data(question):
+# 4️⃣ Test API Key function
+def test_api_key():
+    """Test if the OpenRouter API key is valid"""
+    if not openrouter_api_key:
+        return "❌ No API key provided"
+    
+    try:
+        test_client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=openrouter_api_key,
+        )
+        response = test_client.chat.completions.create(
+            model="mistralai/mistral-small",
+            messages=[{"role": "user", "content": "Hello"}],
+            max_tokens=5
+        )
+        return "✅ OpenRouter API key is valid and working!"
+    except Exception as e:
+        if "invalid_api_key" in str(e) or "401" in str(e):
+            return "❌ Invalid API key. Please check your OpenRouter key."
+        elif "insufficient_quota" in str(e) or "402" in str(e):
+            return "⚠️ API key valid but no credits available."
+        else:
+            return f"❌ API Error: {str(e)}"
+
+# 5️⃣ Mistral insight function
+def ask_mistral_about_data(question):
     global global_df
+    if not openrouter_api_key:
+        return "⚠️ **Error**: `OPENROUTER_API_KEY` not set. Please set your OpenRouter API key."
     if global_df is None:
         return "❌ Please upload a dataset first."
 
@@ -29,179 +80,214 @@ def ask_groq_about_data(question):
             f"Question: {question}\n\nAnswer:"
         )
 
-        headers = {
-            "Authorization": f"Bearer {groq_api_key}",
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "model": "llama3-70b-8192",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.4
-        }
-
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
-            json=payload
+        response = client.chat.completions.create(
+            model="mistralai/mistral-small",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=1500
         )
-        response.raise_for_status()
-        return response.json()['choices'][0]['message']['content'].strip()
+        
+        return response.choices[0].message.content.strip()
 
     except Exception as e:
-        return f"⚠️ Error in ask_groq_about_data:\n{type(e).__name__}: {e}"
+        if "insufficient_quota" in str(e) or "402" in str(e):
+            return f"⚠️ **API Error**: Insufficient credits. Please check your OpenRouter account."
+        elif "invalid_api_key" in str(e) or "401" in str(e):
+            return f"⚠️ **API Error**: Invalid API key. Please check your OpenRouter API key."
+        elif "rate_limit" in str(e) or "429" in str(e):
+            return f"⚠️ **API Error**: Rate limit exceeded. Please try again in a moment."
+        else:
+            return f"⚠️ **An unexpected error occurred**: {type(e).__name__}: {e}"
 
-# 5️⃣ Dataset upload + insight summary + auto plots
+# 6️⃣ Dataset upload + insight summary + auto plots
 def handle_upload(file_path):
     global global_df
+    if file_path is None:
+        return "⏳ Awaiting file...", None, None, None, [], []
+
     try:
-        if file_path.endswith(".csv"):
+        file_ext = os.path.splitext(file_path)[1].lower()
+        if file_ext == ".csv":
             df = pd.read_csv(file_path)
-        elif file_path.endswith(".tsv"):
+        elif file_ext == ".tsv":
             df = pd.read_csv(file_path, sep="\t")
-        elif file_path.endswith((".xls", ".xlsx")):
+        elif file_ext in [".xls", ".xlsx"]:
             df = pd.read_excel(file_path)
-        elif file_path.endswith(".json"):
+        elif file_ext == ".json":
             df = pd.read_json(file_path)
-        elif file_path.endswith(".parquet"):
+        elif file_ext == ".parquet":
             df = pd.read_parquet(file_path)
         else:
-            return "❌ Unsupported file type", None, None, None
+            return f"❌ Unsupported file type: {file_ext}", None, None, None, [], []
     except Exception as e:
-        return f"❌ Error loading file: {type(e).__name__}: {e}", None, None, None
+        return f"❌ Error loading file: {type(e).__name__}: {e}", None, None, None, [], []
 
     global_df = df
     desc = df.describe(include='all').transpose()
-
-    # Additional stats
-    additional_stats = pd.DataFrame()
-    for col in df.select_dtypes(include='number').columns:
-        median = df[col].median()
-        mode = df[col].mode().iloc[0] if not df[col].mode().empty else None
-        q1 = df[col].quantile(0.25)
-        q3 = df[col].quantile(0.75)
-        iqr = q3 - q1
-        min_val = df[col].min()
-        max_val = df[col].max()
-        additional_stats[col] = [median, mode, q1, q3, iqr, min_val, max_val]
-
-    additional_stats.index = ['Median', 'Mode', 'Q1', 'Q3', 'IQR', 'Min', 'Max']
-    stats_output = desc.join(additional_stats.transpose(), how='outer').fillna("-")
-
+    stats_output = desc.fillna("-")
     preview = df.head().reset_index(drop=True)
     auto_plot = auto_visual_summary()
-    return "✅ File uploaded!", preview, stats_output.reset_index(), auto_plot
+    columns = list(df.columns)
 
-# 6️⃣ Auto-generate histograms & count plots
+    # Return updates for all relevant components
+    return "✅ File uploaded!", preview, stats_output.reset_index(), auto_plot, gr.update(choices=columns), gr.update(choices=columns)
+
+# 7️⃣ Auto-generate histograms & count plots
 def auto_visual_summary():
     global global_df
-    fig, axes = plt.subplots(nrows=1, ncols=1, figsize=(10, 6))
-    try:
-        numeric = global_df.select_dtypes(include='number')
-        if not numeric.empty:
-            sns.histplot(numeric.iloc[:, 0], kde=True, ax=axes)
-            axes.set_title(f"Histogram of {numeric.columns[0]}")
-        else:
-            cat = global_df.select_dtypes(include='object')
-            if not cat.empty:
-                sns.countplot(y=cat.iloc[:, 0], ax=axes)
-                axes.set_title(f"Count Plot of {cat.columns[0]}")
-        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        fig.savefig(tmp.name, bbox_inches='tight')
-        plt.close(fig)
-        return tmp.name
-    except Exception as e:
-        print("Auto plot error:", e)
-        return None
+    if global_df is None: return None
+    # Prioritize numeric columns for the initial plot
+    numeric_cols = global_df.select_dtypes(include='number').columns
+    if len(numeric_cols) > 0:
+        col_to_plot = numeric_cols[0]
+        title = f"Histogram of {col_to_plot}"
+        fig = px.histogram(global_df, x=col_to_plot, title=title)
+    else: # Fallback to the first categorical column
+        object_cols = global_df.select_dtypes(include=['object', 'category']).columns
+        if len(object_cols) > 0:
+            col_to_plot = object_cols[0]
+            title = f"Count Plot of {col_to_plot}"
+            fig = px.bar(global_df[col_to_plot].value_counts(), title=title)
+        else: # No suitable columns
+            return None
+    return fig
 
-# 7️⃣ Correlation heatmap
+# 8️⃣ Correlation heatmap
 def generate_heatmap():
     global global_df
     if global_df is None:
-        return None
+        return None, "### ❌ Error\nPlease upload a dataset first."
+
+    numeric_df = global_df.select_dtypes(include='number')
+    if numeric_df.shape[1] < 2:
+        return None, "### ⚠️ Warning\nHeatmap requires at least two numeric columns."
+
     try:
         fig, ax = plt.subplots(figsize=(8, 6))
-        sns.heatmap(global_df.corr(), annot=True, cmap="coolwarm", fmt=".2f", ax=ax)
-        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        fig.savefig(tmp.name, bbox_inches='tight')
-        plt.close(fig)
-        return tmp.name
+        sns.heatmap(numeric_df.corr(numeric_only=True), annot=True, cmap="coolwarm", fmt=".2f", ax=ax)
+        fig.tight_layout()
+        return fig, None # Return figure and no error message
     except Exception as e:
-        print(f"Error generating heatmap: {e}")
-        return None
+        return None, f"### ❌ Error\nCould not generate heatmap: {e}"
 
-# 8️⃣ Custom plot builder
+# 9️⃣ Custom plot builder
 def plot_custom_chart(plot_type, x_col, y_col):
     global global_df
     if global_df is None:
-        return "❌ Please upload a dataset first."
+        return None, "### ❌ Error\nPlease upload a dataset first."
+    if not x_col:
+         return None, "### ⚠️ Warning\nPlease select a column for the X-axis."
+
     try:
         if plot_type == "Scatter":
-            fig = px.scatter(global_df, x=x_col, y=y_col)
+            if not y_col: return None, "### ⚠️ Warning\nScatter plots require a Y-axis column."
+            fig = px.scatter(global_df, x=x_col, y=y_col, title=f"Scatter Plot of {y_col} vs {x_col}")
         elif plot_type == "Bar":
-            fig = px.bar(global_df, x=x_col, y=y_col)
+            if not y_col: return None, "### ⚠️ Warning\nBar plots require a Y-axis column."
+            fig = px.bar(global_df, x=x_col, y=y_col, title=f"Bar Plot of {y_col} by {x_col}")
         elif plot_type == "Histogram":
-            fig = px.histogram(global_df, x=x_col)
+            fig = px.histogram(global_df, x=x_col, title=f"Histogram of {x_col}")
         elif plot_type == "Box":
-            fig = px.box(global_df, x=x_col, y=y_col)
+            fig = px.box(global_df, x=x_col, y=y_col, title=f"Box Plot of {y_col or x_col}")
         else:
-            return "❌ Invalid plot type selected."
-        return fig
+            return None, "### ❌ Error\nInvalid plot type selected."
+        return fig, None # Return figure and no error message
     except Exception as e:
-        return f"⚠️ Error creating plot: {type(e).__name__}: {e}"
-
-# 9️⃣ Get columns for dropdowns
-def get_column_names():
-    global global_df
-    return list(global_df.columns) if global_df is not None else []
+        return None, f"### ❌ Error\nCould not create plot: {e}"
 
 # 🔟 Save AI answer to file
 def save_answer_to_file(answer_text):
+    if not answer_text or answer_text.strip() == "":
+        # Let's use Gradio's warning system for feedback
+        gr.Warning("Cannot save an empty answer!")
+        return None
+
     try:
-        with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False, encoding='utf-8') as f:
             f.write(answer_text)
             return f.name
     except Exception as e:
-        return f"⚠️ Error saving answer: {type(e).__name__}: {e}"
+        gr.Error(f"Error saving file: {e}")
+        return None
 
 # 🔁 Build Gradio Interface
-with gr.Blocks() as demo:
-    gr.Markdown("# 🧠 Groq-Powered AI Data Analysis App")
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 🧠 Mistral Small 3.2 24B Powered AI Data Analysis App")
+    gr.Markdown("Upload a file, get instant insights, create plots, and ask Mistral anything about your data. **Powered by OpenRouter (Free Tier)**")
 
-    with gr.Row():
-        file_input = gr.File(label="📂 Upload CSV / Excel / JSON / Parquet")
-        status = gr.Textbox(label="Status")
+    with gr.Tab("📁 Data Upload & Overview"):
+        with gr.Row():
+            file_input = gr.File(label="Upload CSV, Excel, JSON, or Parquet File", file_types=['.csv','.tsv','.xls','.xlsx','.json','.parquet'])
+            status = gr.Textbox(label="Status", interactive=False)
+        
+        preview = gr.Dataframe(label="📋 Data Preview")
+        stats_table = gr.Dataframe(label="📊 Descriptive Statistics")
+        auto_viz = gr.Plot(label="🔍 Auto Visual Summary")
 
-    preview = gr.Dataframe(label="📋 Data Preview")
-    stats_table = gr.Dataframe(label="📊 Data Insights")
-    auto_viz = gr.Image(label="🔍 Auto Visual Summary")
+    with gr.Tab("📈 Custom Visualization"):
+        with gr.Row():
+            with gr.Column(scale=1):
+                plot_type = gr.Dropdown(["Scatter", "Bar", "Histogram", "Box"], label="Plot Type", value="Histogram")
+                x_column = gr.Dropdown(label="X-axis Column", choices=[], interactive=True)
+                y_column = gr.Dropdown(label="Y-axis Column (Optional for some plots)", choices=[], interactive=True)
+                plot_btn = gr.Button("📊 Generate Custom Plot", variant="primary")
+            with gr.Column(scale=3):
+                plot_output = gr.Plot(label="Custom Plot")
+                plot_error_msg = gr.Markdown() # For displaying plot errors
 
-    file_input.change(fn=handle_upload, inputs=file_input, outputs=[status, preview, stats_table, auto_viz])
+    with gr.Tab("🔥 Correlation Heatmap"):
+        btn_heatmap = gr.Button("Generate Heatmap", variant="primary")
+        heatmap_plot = gr.Plot(label="Heatmap") # Changed from Image to Plot for better error/figure handling
+        heatmap_error_msg = gr.Markdown()
 
-    # Auto-fill column names after upload
-    plot_type = gr.Dropdown(["Scatter", "Bar", "Histogram", "Box"], label="Plot Type")
-    x_column = gr.Dropdown(label="X-axis Column", choices=[], interactive=True)
-    y_column = gr.Dropdown(label="Y-axis Column (Optional)", choices=[], interactive=True)
+    with gr.Tab("🔧 API Key Test"):
+        test_btn = gr.Button("🔍 Test OpenRouter API Key", variant="secondary")
+        test_result = gr.Markdown()
+        gr.Markdown("""
+        ### How to get your OpenRouter API Key:
+        1. Go to [OpenRouter.ai](https://openrouter.ai/)
+        2. Sign up/Login
+        3. Go to [Keys](https://openrouter.ai/keys)
+        4. Create a new API key
+        5. The key should start with `sk-or-v1-`
+        """)
 
-    def update_columns(file): return get_column_names(), get_column_names()
-    file_input.change(fn=update_columns, inputs=file_input, outputs=[x_column, y_column])
+    with gr.Tab("💬 AI Data Chat"):
+        with gr.Row():
+            question = gr.Textbox(label="Ask Mistral a Question", placeholder="e.g., What patterns do you see in this data?")
+            ask_btn = gr.Button("Submit")
+        answer = gr.Markdown(label="Mistral's Insight")
+        with gr.Row():
+            save_btn = gr.Button("💾 Save AI Answer")
+            file_output = gr.File(label="Download Answer", interactive=False)
 
-    plot_btn = gr.Button("📊 Generate Custom Plot")
-    plot_output = gr.Plot(label="Custom Plot")
-    plot_btn.click(fn=plot_custom_chart, inputs=[plot_type, x_column, y_column], outputs=plot_output)
+    # Event Handlers
+    file_input.upload(
+        fn=handle_upload,
+        inputs=file_input,
+        outputs=[status, preview, stats_table, auto_viz, x_column, y_column]
+    )
 
-    gr.Markdown("## 🔥 Correlation Heatmap")
-    btn_heatmap = gr.Button("Generate Heatmap")
-    heatmap_img = gr.Image(label="Heatmap")
-    btn_heatmap.click(fn=generate_heatmap, outputs=heatmap_img)
+    plot_btn.click(
+        fn=plot_custom_chart,
+        inputs=[plot_type, x_column, y_column],
+        outputs=[plot_output, plot_error_msg]
+    )
 
-    gr.Markdown("## 💬 Ask AI Anything About the Data")
-    question = gr.Textbox(label="Ask a Question")
-    answer = gr.Textbox(label="AI Insight")
-    question.submit(fn=ask_groq_about_data, inputs=question, outputs=answer)
+    btn_heatmap.click(
+        fn=generate_heatmap,
+        outputs=[heatmap_plot, heatmap_error_msg]
+    )
 
-    save_btn = gr.Button("💾 Save AI Answer")
-    file_output = gr.File(label="Download")
+    test_btn.click(
+        fn=test_api_key,
+        outputs=test_result
+    )
+
+    # Allow submitting AI question with Enter key or button click
+    question.submit(fn=ask_mistral_about_data, inputs=question, outputs=answer)
+    ask_btn.click(fn=ask_mistral_about_data, inputs=question, outputs=answer)
+
     save_btn.click(fn=save_answer_to_file, inputs=answer, outputs=file_output)
 
-demo.launch(share=True)
+demo.launch(share=True, debug=True)
